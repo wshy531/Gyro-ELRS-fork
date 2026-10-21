@@ -57,6 +57,7 @@
 #if defined(HAS_BASIC_FLIGHT_CONTROL)
 #include "FlightControlConfig.h"
 #include "DriftAssistJson.h"
+#include "FlappingJson.h"
 #include "devFlightControl.h"
 #endif
 
@@ -721,6 +722,9 @@ static void GetConfiguration(AsyncWebServerRequest *request)
     json["config"]["fc_arm_channel"] = flightControlConfig.GetArmChannel() + 1;
     JsonObject configJson = json["config"];
     driftSettingsToJson(configJson["fc_drift"].to<JsonObject>(), flightControlConfig.GetDriftAssist());
+#if defined(GPIO_PIN_PWM_OUTPUTS)
+    flappingSettingsToJson(configJson["fc_flapping"].to<JsonObject>(), flightControlConfig.GetFlapping());
+#endif
     JsonObject modeConditions = configJson["fc_mode_conditions"].to<JsonObject>();
     const char *modeKeys[] = {nullptr, "rate", "angle"};
     for (uint8_t mode = FLIGHT_CONTROL_MODE_RATE; mode < FLIGHT_CONTROL_MODE_COUNT; ++mode)
@@ -832,6 +836,21 @@ static void GetRuntimeStatus(AsyncWebServerRequest *request)
   drift["input_percent"] = driftSnapshot.driftThrottleInput * 0.1f;
   drift["output_percent"] = driftSnapshot.driftThrottleOutput * 0.1f;
   drift["reduction_percent"] = driftSnapshot.driftReduction * 100.0f;
+#if defined(GPIO_PIN_PWM_OUTPUTS)
+  const auto wingSnapshot = flappingGetDebugSnapshot();
+  JsonObject wings = json["flapping"].to<JsonObject>();
+  wings["reason"] = wingSnapshot.reason;
+  wings["configuration_error"] = wingSnapshot.configurationError;
+  wings["rc_valid"] = wingSnapshot.rcValid;
+  wings["armed"] = wingSnapshot.armed;
+  wings["throttle_channel"] = wingSnapshot.throttleChannel;
+  wings["arm_channel"] = wingSnapshot.armChannel;
+  wings["throttle_us"] = wingSnapshot.throttleUs;
+  wings["arm_us"] = wingSnapshot.armUs;
+  wings["left_us"] = wingSnapshot.leftUs;
+  wings["right_us"] = wingSnapshot.rightUs;
+  wings["frequency_hz"] = wingSnapshot.frequencyHz;
+#endif
 #endif
 #if defined(HAS_GYRO)
   JsonObject imu = json["imu"].to<JsonObject>();
@@ -1005,6 +1024,87 @@ static void UpdateConfiguration(AsyncWebServerRequest *request, JsonVariant &jso
   if (json.containsKey("fc_drift") && !driftSettingsFromJson(json["fc_drift"], nextDrift)) {
     request->send(400, "text/plain", "Invalid drift assistance parameters"); return;
   }
+  #if defined(GPIO_PIN_PWM_OUTPUTS)
+  FlappingSettings nextFlapping = flightControlConfig.GetFlapping();
+  if (json.containsKey("fc_flapping") && !flappingSettingsFromJson(json["fc_flapping"], nextFlapping)) {
+    request->send(400, "text/plain", "Invalid flapping parameters"); return;
+  }
+  const bool nextArmEnabled = json["fc_arm_enabled"] | flightControlConfig.GetArmMode();
+  const int nextArmChannel = json["fc_arm_channel"] | (flightControlConfig.GetArmChannel() + 1);
+  unsigned nextWifiChannel = flightControlConfig.GetWifiCoexistEnabled() ? flightControlConfig.GetWifiCoexistChannel() + 1 : 0;
+  if (json.containsKey("fc_wifi_conditions")) {
+    const auto condition = json["fc_wifi_conditions"]["coexist"];
+    nextWifiChannel = condition.is<JsonArray>() && condition.size() == 3 ? condition[0].as<unsigned>() : 0;
+  }
+  if (nextFlapping.enabled) {
+    const auto range = json["fc_arm_range"];
+    if (nextArmChannel < 5 || nextArmChannel > 16 || (json.containsKey("fc_arm_range") &&
+        (!range.is<JsonArray>() || range.size() != 2 || !range[0].is<unsigned>() || !range[1].is<unsigned>() ||
+         range[0].as<unsigned>() < 900 || range[1].as<unsigned>() > 2100 || range[0].as<unsigned>() >= range[1].as<unsigned>()))) {
+      request->send(400, "text/plain", "Invalid flapping ARM configuration"); return;
+    }
+  }
+  FlappingOutputLimits wingOutputs[FC_PWM_OUTPUT_MAX_COUNT];
+  const unsigned outputCount = min((unsigned)GPIO_PIN_PWM_OUTPUTS_COUNT, (unsigned)FC_PWM_OUTPUT_MAX_COUNT);
+  bool wingContextChanged = nextArmEnabled != flightControlConfig.GetArmMode() ||
+    nextArmChannel != flightControlConfig.GetArmChannel() + 1 ||
+    nextWifiChannel != (flightControlConfig.GetWifiCoexistEnabled() ? flightControlConfig.GetWifiCoexistChannel() + 1U : 0U);
+  bool wingOutputsChanged = false;
+  const bool inspectWingOutputs = nextFlapping.enabled || flightControlConfig.GetFlapping().enabled;
+  if (inspectWingOutputs && json.containsKey("pwm") && (!json["pwm"].is<JsonArray>() || json["pwm"].size() > outputCount)) {
+    request->send(400, "text/plain", "Invalid PWM configuration"); return;
+  }
+  for (unsigned ch = 0; ch < outputCount && inspectWingOutputs; ++ch) {
+    rx_config_pwm_t pwm = *config.GetPwmChannel(ch);
+    if (json["pwm"].is<JsonArray>() && ch < json["pwm"].size()) {
+      if (!json["pwm"][ch].is<uint32_t>()) { request->send(400, "text/plain", "Invalid PWM configuration"); return; }
+      pwm.raw = json["pwm"][ch].as<uint32_t>();
+    }
+    const unsigned frequencies[] = {50, 60, 100, 160, 333, 400};
+    auto &o = wingOutputs[ch];
+    o.frequency = pwm.val.mode < 6 ? frequencies[pwm.val.mode] : 0;
+    o.available = GPIO_PIN_PWM_OUTPUTS[ch] != UNDEF_PIN && o.frequency != 0 && !pwm.val.narrow;
+    const auto &limits = flightControlConfig.GetPwmOutputLimits(ch);
+    o.minUs = limits.minUs; o.maxUs = limits.maxUs;
+    if (json["fc_pwm_output_limits"].is<JsonArray>() && ch < json["fc_pwm_output_limits"].size()) {
+      const auto l = json["fc_pwm_output_limits"][ch];
+      if (l.is<JsonArray>() && l.size() == 3) {
+        if (!l[0].is<unsigned>() || !l[1].is<unsigned>() || !l[2].is<unsigned>() ||
+            l[0].as<unsigned>() < 500 || l[2].as<unsigned>() > 2500 ||
+            l[0].as<unsigned>() >= l[1].as<unsigned>() || l[1].as<unsigned>() >= l[2].as<unsigned>()) {
+          request->send(400, "text/plain", "Invalid PWM output limits"); return;
+        }
+        o.minUs = l[0]; o.maxUs = l[2];
+      }
+    }
+    const auto &old = flightControlConfig.GetFlapping();
+    if (ch + 1 == old.left.output || ch + 1 == old.right.output || ch + 1 == nextFlapping.left.output || ch + 1 == nextFlapping.right.output) {
+      wingOutputsChanged |= pwm.raw != config.GetPwmChannel(ch)->raw || o.minUs != limits.minUs || o.maxUs != limits.maxUs;
+    }
+  }
+  const char *wingError = flappingContextError(nextFlapping, nextArmEnabled, nextArmChannel,
+    nextWifiChannel, nextDrift.enabled, wingOutputs, outputCount);
+  if (wingError) { request->send(400, "text/plain", wingError); return; }
+  const auto &oldFlapping = flightControlConfig.GetFlapping();
+  // Hardware mode/limit changes cannot take effect halfway through parking.
+  if (oldFlapping.enabled && wingOutputsChanged && !flappingOutputsParked()) {
+    request->send(409, "text/plain", "Lower throttle to zero and wait for wings to park before changing flapping"); return;
+  }
+  wingContextChanged |= wingOutputsChanged;
+  if ((oldFlapping.enabled || nextFlapping.enabled) &&
+      (!flappingSettingsEqual(oldFlapping, nextFlapping) || wingContextChanged)) {
+    if (connectionState == connected) {
+      const auto channelValid = [](unsigned ch) { return ch < 16 && ChannelData[ch] >= CRSF_CHANNEL_VALUE_MIN && ChannelData[ch] <= CRSF_CHANNEL_VALUE_MAX; };
+      const bool armed = flightControlConfig.GetArmMode() && FlightControlRangeIsActive(
+        flightControlConfig.GetArmRange(), CRSF_to_US(ChannelData[flightControlConfig.GetArmChannel()]));
+      const bool stateValid = connectionHasModelMatch && teamraceHasModelMatch && channelValid(flightControlConfig.GetArmChannel()) &&
+        channelValid(oldFlapping.throttleChannel - 1) && channelValid(nextFlapping.throttleChannel - 1);
+      const char *changeError = flappingChangeError(true, stateValid, armed,
+        CRSF_to_US(ChannelData[oldFlapping.throttleChannel - 1]), CRSF_to_US(ChannelData[nextFlapping.throttleChannel - 1]), flappingOutputsParked());
+      if (changeError) { request->send(409, "text/plain", changeError); return; }
+    }
+  }
+  #endif
   if (json.containsKey("fc_drift")) {
     FlightControlDebugSnapshot snapshot = {};
     const bool snapshotValid = flightControlGetDebugSnapshot(snapshot);
@@ -1192,8 +1292,11 @@ static void UpdateConfiguration(AsyncWebServerRequest *request, JsonVariant &jso
     }
   }
   if (json.containsKey("fc_drift")) flightControlConfig.SetDriftAssist(nextDrift);
-  if (!flightControlConfig.Commit() && json.containsKey("fc_drift")) {
-    request->send(500, "text/plain", "Failed to persist drift assistance configuration"); return;
+  #if defined(GPIO_PIN_PWM_OUTPUTS)
+  if (json.containsKey("fc_flapping")) flightControlConfig.SetFlapping(nextFlapping);
+  #endif
+  if (!flightControlConfig.Commit() && (json.containsKey("fc_drift") || json.containsKey("fc_flapping"))) {
+    request->send(500, "text/plain", "Failed to persist flight control configuration"); return;
   }
   #endif
 

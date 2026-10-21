@@ -30,6 +30,106 @@ static bool newChannelsAvailable;
 static constexpr uint32_t FAILSAFE_ABS_TIMEOUT_MS = 1000U;
 
 #if defined(HAS_BASIC_FLIGHT_CONTROL) && defined(TARGET_RX)
+uint16_t servoOutputModeToFrequency(eServoOutputMode mode);
+static FlappingController flapping;
+static uint16_t flappingPwmFrequencies[PWM_MAX_CHANNELS];
+bool flappingOutputsParked() { return flapping.parked(); }
+static FlappingDebugSnapshot flappingSnapshot;
+#if defined(PLATFORM_ESP32)
+static portMUX_TYPE flappingSnapshotMux = portMUX_INITIALIZER_UNLOCKED;
+#endif
+
+FlappingDebugSnapshot flappingGetDebugSnapshot()
+{
+#if defined(PLATFORM_ESP32)
+    portENTER_CRITICAL(&flappingSnapshotMux);
+#endif
+    const auto snapshot = flappingSnapshot;
+#if defined(PLATFORM_ESP32)
+    portEXIT_CRITICAL(&flappingSnapshotMux);
+#endif
+    return snapshot;
+}
+
+static bool flappingOwnsChannel(unsigned ch)
+{
+    const auto &s = flapping.settings();
+    return flapping.ownsOutputs() && (ch + 1 == s.left.output || ch + 1 == s.right.output);
+}
+
+static void updateFlapping(uint32_t nowUs, bool rcFresh, bool suspended)
+{
+    const auto &s = flightControlConfig.GetFlapping();
+    // Keep diagnostics available even when the mode is disabled.
+    const uint32_t throttle = ChannelData[s.throttleChannel - 1];
+    const uint32_t steering = ChannelData[s.steeringChannel - 1];
+    const uint32_t arm = ChannelData[flightControlConfig.GetArmChannel()];
+    const bool valid = rcFresh && connectionState == connected && connectionHasModelMatch && teamraceHasModelMatch &&
+        throttle >= CRSF_CHANNEL_VALUE_MIN && throttle <= CRSF_CHANNEL_VALUE_MAX &&
+        steering >= CRSF_CHANNEL_VALUE_MIN && steering <= CRSF_CHANNEL_VALUE_MAX &&
+        arm >= CRSF_CHANNEL_VALUE_MIN && arm <= CRSF_CHANNEL_VALUE_MAX;
+    const bool armed = flightControlConfig.GetArmMode() && FlightControlRangeIsActive(
+        flightControlConfig.GetArmRange(), CRSF_to_US(arm));
+    const char *configurationError = nullptr;
+    if (s.enabled) {
+        FlappingOutputLimits outputs[FC_PWM_OUTPUT_MAX_COUNT];
+        const unsigned count = min((unsigned)GPIO_PIN_PWM_OUTPUTS_COUNT, (unsigned)FC_PWM_OUTPUT_MAX_COUNT);
+        for (unsigned ch = 0; ch < count; ++ch) {
+            const auto *pwm = config.GetPwmChannel(ch);
+            auto &o = outputs[ch];
+            const auto configuredFrequency = servoOutputModeToFrequency((eServoOutputMode)pwm->val.mode);
+            // PWM allocation happens at startup. A newly saved refresh rate must
+            // not make the frequency guard assume hardware has already changed.
+            o.frequency = flappingPwmFrequencies[ch];
+            o.available = servoPins[ch] != UNDEF_PIN && configuredFrequency >= 50 && configuredFrequency <= 400 &&
+                o.frequency >= 50 && o.frequency <= 400 && !pwm->val.narrow;
+            o.minUs = flightControlConfig.GetPwmOutputLimits(ch).minUs;
+            o.maxUs = flightControlConfig.GetPwmOutputLimits(ch).maxUs;
+        }
+        configurationError = flappingContextError(s, flightControlConfig.GetArmMode(), flightControlConfig.GetArmChannel() + 1,
+            flightControlConfig.GetWifiCoexistEnabled() ? flightControlConfig.GetWifiCoexistChannel() + 1 : 0,
+            flightControlConfig.GetDriftAssist().enabled, outputs, count);
+    }
+    static uint32_t revision = UINT32_MAX;
+    const bool configChanged = revision != flightControlConfig.GetRevision();
+    revision = flightControlConfig.GetRevision();
+    const bool ownedBefore = flapping.ownsOutputs();
+    const unsigned oldLeftOutput = flapping.settings().left.output, oldRightOutput = flapping.settings().right.output;
+    if (s.enabled || flapping.ownsOutputs())
+        flapping.update(s, nowUs, valid && armed && !configurationError && !suspended && !configChanged,
+            (CRSF_to_US(throttle) - 988.0f) / 1024.0f, (CRSF_to_US(steering) - 1500.0f) / 512.0f);
+    const auto &active = flapping.settings();
+    if (flapping.ownsOutputs() && (!ownedBefore || oldLeftOutput != active.left.output || oldRightOutput != active.right.output) &&
+        active.left.output <= GPIO_PIN_PWM_OUTPUTS_COUNT && active.right.output <= GPIO_PIN_PWM_OUTPUTS_COUNT) {
+        const auto actualOrPark = [](uint16_t actual, uint16_t park) { return actual >= 500 && actual <= 2500 ? actual : park; };
+        flapping.suspend(actualOrPark(pwmChannelValues[active.left.output - 1], active.left.parkUs),
+            actualOrPark(pwmChannelValues[active.right.output - 1], active.right.parkUs), nowUs);
+    }
+    FlappingDebugSnapshot snapshot;
+    snapshot.rcValid = valid;
+    snapshot.armed = valid && armed;
+    snapshot.throttleChannel = s.throttleChannel;
+    snapshot.armChannel = flightControlConfig.GetArmChannel() + 1;
+    snapshot.throttleUs = CRSF_to_US(throttle);
+    snapshot.armUs = CRSF_to_US(arm);
+    snapshot.leftUs = flapping.leftUs(); snapshot.rightUs = flapping.rightUs();
+    snapshot.frequencyHz = flapping.frequencyHz();
+    snapshot.configurationError = configurationError;
+    snapshot.reason = !s.enabled ? "disabled" :
+        flightControlConfig.GetPwmOutputWifiEnabled() ? "pwm_test" :
+        connectionState == wifiUpdate ? "wifi_only" :
+        !valid ? "rc_unavailable" : !armed ? "disarmed" :
+        configurationError ? "configuration_invalid" :
+        configChanged ? "configuration_changed" : flapping.stateReason();
+#if defined(PLATFORM_ESP32)
+    portENTER_CRITICAL(&flappingSnapshotMux);
+#endif
+    flappingSnapshot = snapshot;
+#if defined(PLATFORM_ESP32)
+    portEXIT_CRITICAL(&flappingSnapshotMux);
+#endif
+}
+
 static bool flightControlMotorOutputEnabled()
 {
     if (!flightControlConfig.GetArmMode())
@@ -138,6 +238,9 @@ static void servosFailsafe()
     for (int ch = 0 ; ch < GPIO_PIN_PWM_OUTPUTS_COUNT ; ++ch)
     {
         const rx_config_pwm_t *chConfig = config.GetPwmChannel(ch);
+#if defined(HAS_BASIC_FLIGHT_CONTROL) && defined(TARGET_RX)
+        if (flappingOwnsChannel(ch)) continue;
+#endif
         if (chConfig->val.failsafeMode == PWMFAILSAFE_SET_POSITION) {
             // Always write the failsafe position even if the servo has never been started,
             // so all the servos go to their expected position
@@ -200,6 +303,32 @@ static void servosUpdate(unsigned long now)
     static uint32_t lastUpdate;
 #if defined(HAS_BASIC_FLIGHT_CONTROL) && defined(TARGET_RX)
     const bool outputEnabled = flightControlConfig.GetPwmOutputWifiEnabled();
+    static bool haveChannels = false;
+    if (newChannelsAvailable) { lastUpdate = now; haveChannels = true; }
+    const bool rcFresh = haveChannels && now - lastUpdate <= FAILSAFE_ABS_TIMEOUT_MS && getLq() > 0;
+    const bool suspended = connectionState == wifiUpdate || outputEnabled;
+    static uint32_t lastFlappingUs = 0;
+    const uint32_t nowUs = micros();
+    if ((uint32_t)(nowUs - lastFlappingUs) >= 4000U) {
+        lastFlappingUs = nowUs;
+        updateFlapping(nowUs, rcFresh, suspended);
+    }
+    if (!outputEnabled && flapping.ownsOutputs()) {
+        static uint32_t lastWingWriteUs[PWM_MAX_CHANNELS] = {};
+        const auto &s = flapping.settings();
+        const FlappingWing wings[] = {s.left, s.right};
+        const uint16_t values[] = {flapping.leftUs(), flapping.rightUs()};
+        for (unsigned i = 0; i < 2; ++i) {
+            const unsigned ch = wings[i].output - 1;
+            if (ch >= GPIO_PIN_PWM_OUTPUTS_COUNT || !usesConfigurablePwmLimits(config.GetPwmChannel(ch))) continue;
+            const unsigned frequency = flappingPwmFrequencies[ch];
+            if (!frequency || (uint32_t)(nowUs - lastWingWriteUs[ch]) < (1000000U + frequency - 1) / frequency) continue;
+            // Calculate at 4 ms, but submit at most one command per physical PWM frame.
+            lastWingWriteUs[ch] = nowUs;
+            const auto &limits = flightControlConfig.GetPwmOutputLimits(ch);
+            servoWrite(ch, constrain(values[i], limits.minUs, limits.maxUs));
+        }
+    }
     if (connectionState == wifiUpdate
 #if defined(PLATFORM_ESP32)
         || (isFlightControlWifiCoexist() && outputEnabled)
@@ -209,6 +338,7 @@ static void servosUpdate(unsigned long now)
         for (int ch = 0; ch < GPIO_PIN_PWM_OUTPUTS_COUNT; ++ch)
         {
             const rx_config_pwm_t *chConfig = config.GetPwmChannel(ch);
+            if (!outputEnabled && flappingOwnsChannel(ch)) continue;
             if (usesConfigurablePwmLimits(chConfig))
             {
                 uint16_t us = outputEnabled
@@ -220,6 +350,13 @@ static void servosUpdate(unsigned long now)
                 }
                 servoWrite(ch, us);
             }
+        }
+        if (outputEnabled && flapping.ownsOutputs()) {
+            const auto &s = flapping.settings();
+            if (s.left.output <= GPIO_PIN_PWM_OUTPUTS_COUNT && s.right.output <= GPIO_PIN_PWM_OUTPUTS_COUNT)
+                flapping.suspend(
+                    constrain(pwmChannelValues[s.left.output - 1], 500U, 2500U),
+                    constrain(pwmChannelValues[s.right.output - 1], 500U, 2500U), nowUs);
         }
         return;
     }
@@ -236,15 +373,17 @@ static void servosUpdate(unsigned long now)
         {
             const rx_config_pwm_t *chConfig = config.GetPwmChannel(ch);
 #if defined(HAS_BASIC_FLIGHT_CONTROL) && defined(TARGET_RX)
+            if (flappingOwnsChannel(ch)) continue;
             // Per-channel mixer mode: use flight control mixer output
             if (chConfig->val.mixerMode)
             {
-                if (ch < mixerOutput.motorCount)
+                if (ch < mixerOutput.motorCount || flightControlConfig.GetFlapping().enabled)
                 {
                     const bool isServo = flightControlConfig.GetMixerOutputServo(ch);
-                    if (motorOutputEnabled || isServo)
+                    if ((motorOutputEnabled && !flightControlConfig.GetFlapping().enabled) || isServo)
                     {
-                        uint16_t us = mixerOutput.motorUs[ch];
+                        uint16_t us = flightControlConfig.GetFlapping().enabled
+                            ? 1500U : mixerOutput.motorUs[ch];
                         if (chConfig->val.inverted)
                         {
                             us = 3000U - us;
@@ -380,6 +519,9 @@ static int event()
             if (frequency && servoPins[ch] != UNDEF_PIN)
             {
                 pwmChannels[ch] = PWM.allocate(servoPins[ch], frequency);
+#if defined(HAS_BASIC_FLIGHT_CONTROL) && defined(TARGET_RX)
+                flappingPwmFrequencies[ch] = pwmChannels[ch] >= 0 ? frequency : 0;
+#endif
             }
 #if defined(PLATFORM_ESP32)
             else if ((eServoOutputMode)chConfig->val.mode == somDShot)

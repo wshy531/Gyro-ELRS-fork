@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include "DriftAssist.h"
+#include "Flapping.h"
 
 constexpr uint8_t FC_PID_TERM_COUNT = 12;
 constexpr uint8_t FC_RATE_FF_TERM_COUNT = 3;
@@ -82,6 +83,8 @@ public:
     void SetDefaults();
     const DriftAssistSettings &GetDriftAssist() const { return m_drift; }
     void SetDriftAssist(const DriftAssistSettings &settings);
+    const FlappingSettings &GetFlapping() const { return m_flapping; }
+    void SetFlapping(const FlappingSettings &settings);
     uint32_t GetRevision() const { return m_revision; }
     bool DriftMixerCompatible() const;
     bool DriftChannelCompatible() const;
@@ -182,6 +185,7 @@ private:
     uint8_t m_armChannel = FC_ARM_CHANNEL_DEFAULT;
     FlightControlChannelRange m_armRange = {};
     DriftAssistSettings m_drift;
+    FlappingSettings m_flapping;
     uint32_t m_revision = 0;
     bool m_modified = false;
 };

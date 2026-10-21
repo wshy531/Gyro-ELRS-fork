@@ -3,6 +3,7 @@
 #if defined(HAS_BASIC_FLIGHT_CONTROL) && defined(TARGET_RX)
 
 #include "DriftAssistJson.h"
+#include "FlappingJson.h"
 #include <ArduinoJson.h>
 #include <FS.h>
 #if defined(PLATFORM_ESP32)
@@ -19,6 +20,7 @@ FlightControlConfig flightControlConfig;
 void FlightControlConfig::SetDefaults()
 {
     m_drift = DriftAssistSettings{};
+    m_flapping = FlappingSettings{};
     memset(m_ratePid, 0, sizeof(m_ratePid));
     memset(m_rateFeedforward, 0, sizeof(m_rateFeedforward));
     memset(m_anglePid, 0, sizeof(m_anglePid));
@@ -89,6 +91,7 @@ void FlightControlConfig::Load()
 
     // Missing or malformed drift settings never enable assistance.
     driftSettingsFromJson(doc["drift"], m_drift);
+    flappingSettingsFromJson(doc["flapping"], m_flapping);
     JsonArray ratePid = doc["rate_pid"].as<JsonArray>();
     for (uint8_t i = 0; i < min(ratePid.size(), (size_t)FC_PID_TERM_COUNT); ++i)
     {
@@ -266,6 +269,7 @@ bool FlightControlConfig::Commit()
 
     JsonDocument doc;
     driftSettingsToJson(doc["drift"].to<JsonObject>(), m_drift);
+    flappingSettingsToJson(doc["flapping"].to<JsonObject>(), m_flapping);
     copyArray(m_ratePid, doc["rate_pid"].to<JsonArray>());
     copyArray(m_rateFeedforward, doc["rate_ff"].to<JsonArray>());
     copyArray(m_anglePid, doc["angle_pid"].to<JsonArray>());
@@ -339,6 +343,13 @@ bool FlightControlConfig::Commit()
     m_modified = false;
     ++m_revision;
     return true;
+}
+
+void FlightControlConfig::SetFlapping(const FlappingSettings &settings)
+{
+    if (!flappingSettingsValid(settings) || flappingSettingsEqual(m_flapping, settings)) return;
+    m_flapping = settings;
+    m_modified = true;
 }
 
 void FlightControlConfig::SetDriftAssist(const DriftAssistSettings &settings)
